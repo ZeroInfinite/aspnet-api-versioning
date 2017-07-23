@@ -6,16 +6,14 @@
     using Extensions.Logging;
     using Extensions.Options;
     using Http;
-    using Http.Extensions;
     using Infrastructure;
     using Internal;
     using System;
+    using System.Collections;
     using System.Collections.Generic;
     using System.Diagnostics.Contracts;
     using System.Linq;
-    using static ApiVersion;
-    using static System.Environment;
-    using static System.String;
+    using static ErrorCodes;
 
     /// <summary>
     /// Represents the logic for selecting an API-versioned, action method.
@@ -27,7 +25,6 @@
         readonly IActionSelectorDecisionTreeProvider decisionTreeProvider;
         readonly ActionConstraintCache actionConstraintCache;
         readonly IOptions<ApiVersioningOptions> options;
-        readonly ILogger logger;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ApiVersionActionSelector"/> class.
@@ -42,10 +39,15 @@
             IOptions<ApiVersioningOptions> options,
             ILoggerFactory loggerFactory )
         {
+            Arg.NotNull( decisionTreeProvider, nameof( decisionTreeProvider ) );
+            Arg.NotNull( actionConstraintCache, nameof( actionConstraintCache ) );
+            Arg.NotNull( options, nameof( options ) );
+            Arg.NotNull( loggerFactory, nameof( loggerFactory ) );
+
             this.decisionTreeProvider = decisionTreeProvider;
             this.actionConstraintCache = actionConstraintCache;
             this.options = options;
-            logger = loggerFactory.CreateLogger<ApiVersionActionSelector>();
+            Logger = loggerFactory.CreateLogger( GetType() );
         }
 
         /// <summary>
@@ -60,6 +62,12 @@
         /// <value>The <see cref="IApiVersionSelector">API version selector</see> used to select the default
         /// <see cref="ApiVersion">API version</see> when a client does not specify a version.</value>
         protected IApiVersionSelector ApiVersionSelector => Options.ApiVersionSelector;
+
+        /// <summary>
+        /// Gets the logger associated with the action selector.
+        /// </summary>
+        /// <value>The associated <see cref="ILogger">logger</see>.</value>
+        protected ILogger Logger { get; }
 
         /// <summary>
         /// Selects a list of candidate actions from the specified route context.
@@ -86,44 +94,53 @@
             Arg.NotNull( candidates, nameof( candidates ) );
 
             var httpContext = context.HttpContext;
-            var invalidRequestHandler = default( RequestHandler );
 
-            if ( ( invalidRequestHandler = VerifyRequestedApiVersionIsNotAmbiguous( httpContext, out var apiVersion ) ) != null )
+            if ( ( context.Handler = VerifyRequestedApiVersionIsNotAmbiguous( httpContext, out var apiVersion ) ) != null )
             {
-                context.Handler = invalidRequestHandler;
                 return null;
             }
 
             var matches = EvaluateActionConstraints( context, candidates );
             var selectionContext = new ActionSelectionContext( httpContext, matches, apiVersion );
             var finalMatches = SelectBestActions( selectionContext );
+            var properties = httpContext.ApiVersionProperties();
+            var selectionResult = properties.SelectionResult;
 
-            if ( finalMatches == null || finalMatches.Count == 0 )
+            properties.ApiVersion = selectionContext.RequestedVersion;
+            selectionResult.AddCandidates( candidates );
+
+            if ( finalMatches == null )
             {
-                if ( ( invalidRequestHandler = IsValidRequest( selectionContext, candidates ) ) != null )
-                {
-                    context.Handler = invalidRequestHandler;
-                }
-
+                selectionResult.EndIteration();
                 return null;
             }
-            else if ( finalMatches.Count == 1 )
+
+            if ( finalMatches.Count == 1 )
             {
                 var selectedAction = finalMatches[0];
-                selectedAction.AggregateAllVersions( selectionContext );
-                httpContext.ApiVersionProperties().ApiVersion = selectionContext.RequestedVersion;
-                return selectedAction;
+
+                // note: short-circuit if the api version policy has already been applied to the match
+                // and there are no other matches in a previous iteration which would take precendence
+                if ( selectedAction.VersionPolicyIsApplied() && !selectionResult.HasMatchesInPreviousIterations )
+                {
+                    httpContext.ApiVersionProperties().ApiVersion = selectionContext.RequestedVersion;
+                    return selectedAction;
+                }
             }
-            else
+
+            if ( finalMatches.Count > 0 )
             {
-                var actionNames = Join( NewLine, finalMatches.Select( a => a.DisplayName ) );
+                var routeData = new RouteData( context.RouteData );
+                var matchingActions = new MatchingActionSequence( finalMatches, routeData );
 
-                logger.AmbiguousActions( actionNames );
-
-                var message = SR.ActionSelector_AmbiguousActions.FormatDefault( NewLine, actionNames );
-
-                throw new AmbiguousActionException( message );
+                selectionResult.AddMatches( matchingActions );
+                selectionResult.TrySetBestMatch( matchingActions.BestMatch );
             }
+
+            // note: even though we may have had a successful match, this method could be called multiple times. the final decision
+            // is made by the IApiVersionRoutePolicy. we return here to make sure all candidates have been considered at least once.
+            selectionResult.EndIteration();
+            return null;
         }
 
         /// <summary>
@@ -190,83 +207,12 @@
             }
             catch ( AmbiguousApiVersionException ex )
             {
-                logger.LogInformation( ex.Message );
+                Logger.LogInformation( ex.Message );
                 apiVersion = default( ApiVersion );
-                return new BadRequestHandler( Options, "AmbiguousApiVersion", ex.Message );
+                return new BadRequestHandler( Options.ErrorResponses, AmbiguousApiVersion, ex.Message );
             }
 
             return null;
-        }
-
-        RequestHandler IsValidRequest( ActionSelectionContext context, IReadOnlyList<ActionDescriptor> candidates )
-        {
-            Contract.Requires( context != null );
-            Contract.Requires( candidates != null );
-
-            if ( !context.MatchingActions.Any() && !candidates.Any() )
-            {
-                return null;
-            }
-
-            var code = default( string );
-            var requestedVersion = default( string );
-            var parsedVersion = context.RequestedVersion;
-            var actionNames = new Lazy<string>( () => Join( NewLine, candidates.Select( a => a.DisplayName ) ) );
-            var allowedMethods = new Lazy<HashSet<string>>(
-                () => new HashSet<string>( candidates.SelectMany( c => c.ActionConstraints.OfType<HttpMethodActionConstraint>() )
-                                                     .SelectMany( ac => ac.HttpMethods ),
-                                           StringComparer.OrdinalIgnoreCase ) );
-            var newRequestHandler = default( Func<ApiVersioningOptions, string, string, RequestHandler> );
-
-            if ( parsedVersion == null )
-            {
-                requestedVersion = context.HttpContext.ApiVersionProperties().RawApiVersion;
-
-                if ( IsNullOrEmpty( requestedVersion ) )
-                {
-                    code = "ApiVersionUnspecified";
-                    logger.ApiVersionUnspecified( actionNames.Value );
-                    return new BadRequestHandler( Options, code, SR.ApiVersionUnspecified );
-                }
-                else if ( TryParse( requestedVersion, out parsedVersion ) )
-                {
-                    code = "UnsupportedApiVersion";
-                    logger.ApiVersionUnmatched( parsedVersion, actionNames.Value );
-
-                    if ( allowedMethods.Value.Contains( context.HttpContext.Request.Method ) )
-                    {
-                        newRequestHandler = ( o, c, m ) => new BadRequestHandler( o, c, m );
-                    }
-                    else
-                    {
-                        newRequestHandler = ( o, c, m ) => new MethodNotAllowedHandler( o, c, m, allowedMethods.Value.ToArray() );
-                    }
-                }
-                else
-                {
-                    code = "InvalidApiVersion";
-                    logger.ApiVersionInvalid( requestedVersion );
-                    newRequestHandler = ( o, c, m ) => new BadRequestHandler( o, c, m );
-                }
-            }
-            else
-            {
-                requestedVersion = parsedVersion.ToString();
-                code = "UnsupportedApiVersion";
-                logger.ApiVersionUnmatched( parsedVersion, actionNames.Value );
-
-                if ( allowedMethods.Value.Contains( context.HttpContext.Request.Method ) )
-                {
-                    newRequestHandler = ( o, c, m ) => new BadRequestHandler( o, c, m );
-                }
-                else
-                {
-                    newRequestHandler = ( o, c, m ) => new MethodNotAllowedHandler( o, c, m, allowedMethods.Value.ToArray() );
-                }
-            }
-
-            var message = SR.VersionedResourceNotSupported.FormatDefault( context.HttpContext.Request.GetDisplayUrl(), requestedVersion );
-            return newRequestHandler( Options, code, message );
         }
 
         static IEnumerable<ActionDescriptor> MatchVersionNeutralActions( ActionSelectionContext context ) =>
@@ -384,7 +330,7 @@
                         if ( !constraint.Accept( constraintContext ) )
                         {
                             isMatch = false;
-                            logger.ConstraintMismatch( candidate.Action.DisplayName, candidate.Action.Id, constraint );
+                            Logger.ConstraintMismatch( candidate.Action.DisplayName, candidate.Action.Id, constraint );
                             break;
                         }
                     }
@@ -418,6 +364,63 @@
             {
                 return EvaluateActionConstraintsCore( context, actionsWithoutConstraint, order );
             }
+        }
+
+        sealed class MatchingActionSequence : IEnumerable<ActionDescriptorMatch>
+        {
+            readonly IReadOnlyList<ActionDescriptor> matches;
+            readonly RouteData routeData;
+
+            internal MatchingActionSequence( IReadOnlyList<ActionDescriptor> matches, RouteData routeData )
+            {
+                Contract.Requires( matches != null );
+                Contract.Requires( matches.Count > 0 );
+                Contract.Requires( routeData != null );
+
+                this.matches = matches;
+                this.routeData = routeData;
+            }
+
+            internal ActionDescriptorMatch BestMatch { get; private set; }
+
+            RouteData NewMatchRouteData( ActionDescriptor match )
+            {
+                Contract.Requires( match != null );
+                Contract.Ensures( Contract.Result<RouteData>() != null );
+
+                var matchedRouteData = new RouteData( routeData );
+                var matchedRouteValues = matchedRouteData.Values;
+
+                foreach ( var entry in match.RouteValues )
+                {
+                    if ( !matchedRouteValues.ContainsKey( entry.Key ) )
+                    {
+                        matchedRouteValues.Add( entry.Key, entry.Value );
+                    }
+                }
+
+                return matchedRouteData;
+            }
+
+            public IEnumerator<ActionDescriptorMatch> GetEnumerator()
+            {
+                if ( matches.Count == 1 )
+                {
+                    var match = matches[0];
+                    BestMatch = new ActionDescriptorMatch( match, NewMatchRouteData( match ) );
+                    yield return BestMatch;
+                }
+                else
+                {
+                    for ( var i = 0; i < matches.Count; i++ )
+                    {
+                        var match = matches[i];
+                        yield return new ActionDescriptorMatch( match, NewMatchRouteData( match ) );
+                    }
+                }
+            }
+
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
         }
     }
 }

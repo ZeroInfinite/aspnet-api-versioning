@@ -23,8 +23,7 @@
         {
             Contract.Requires( controllerDescriptor != null );
 
-            var value = default( bool? );
-            controllerDescriptor.Properties.TryGetValue( AttributeRoutedPropertyKey, out value );
+            controllerDescriptor.Properties.TryGetValue( AttributeRoutedPropertyKey, out bool? value );
             return value ?? false;
         }
 
@@ -91,9 +90,7 @@
                 ApiVersionInfoKey,
                 key =>
                 {
-                    var value = default( object );
-
-                    if ( properties.TryRemove( ConventionsApiVersionInfoKey, out value ) )
+                    if ( properties.TryRemove( ConventionsApiVersionInfoKey, out var value ) )
                     {
                         return ( (ApiVersionModel) value ).Aggregate( model );
                     }
@@ -160,7 +157,7 @@
         /// <param name="controllerDescriptor">The <see cref="HttpControllerDescriptor">controller</see> to evaluate.</param>
         /// <returns>A <see cref="IReadOnlyList{T}">read-only list</see> of <see cref="ApiVersion">API versions</see>
         /// declared by the controller.</returns>
-        /// <remarks>The declared API versions are constrainted to the versions declared explicitly by the specified controller.</remarks>
+        /// <remarks>The declared API versions are constrained to the versions declared explicitly by the specified controller.</remarks>
         public static IReadOnlyList<ApiVersion> GetDeclaredApiVersions( this HttpControllerDescriptor controllerDescriptor ) => controllerDescriptor.GetApiVersionModel().DeclaredApiVersions;
 
         /// <summary>
